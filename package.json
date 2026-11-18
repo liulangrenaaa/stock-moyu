@@ -1,0 +1,84 @@
+{
+  "name": "stock-moyu",
+  "displayName": "股票摸鱼 · Stock Moyu",
+  "description": "在 VS Code 状态栏查看股票行情。",
+  "version": "0.1.0",
+  "publisher": "liulangrenaaa",
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "股票",
+    "行情",
+    "stock"
+  ],
+  "main": "./extension.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/liulangrenaaa/stock-moyu.git"
+  },
+  "bugs": {
+    "url": "https://github.com/liulangrenaaa/stock-moyu/issues"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "stockMoyu.start",
+        "title": "开启行情",
+        "category": "Stock Moyu"
+      },
+      {
+        "command": "stockMoyu.stop",
+        "title": "停止行情",
+        "category": "Stock Moyu"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "stockMoyu.start",
+          "group": "navigation@100"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Stock Moyu 股票摸鱼",
+      "properties": {
+        "stockMoyu.stockCodes": {
+          "type": "array",
+          "default": [
+            "sh000001",
+            "sz002649"
+          ],
+          "minItems": 1,
+          "maxItems": 50,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^(sh|sz|bj)[0-9]{6}$"
+          },
+          "description": "股票或指数代码，支持 sh、sz、bj 前缀。"
+        },
+        "stockMoyu.updateInterval": {
+          "type": "integer",
+          "default": 3000,
+          "minimum": 1000,
+          "maximum": 3600000,
+          "description": "每次请求完成后等待的刷新间隔，单位毫秒，修改后立即生效。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "check": "node --check extension.js && node --check getStock.js",
+    "test": "node --test",
+    "package": "vsce package --skip-license"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "4.1.1"
+  }
+}
