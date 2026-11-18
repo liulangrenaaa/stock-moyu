@@ -3,7 +3,8 @@ const assert = require('node:assert/strict');
 const { createStockController } = require('../extension');
 
 const SAMPLE = [{
-    code: 'sh000001', name: '上证指数', price: '3587.83', changePercent: '0.09'
+    code: 'sh000001', name: '上证指数', price: '3587.83', changePercent: '0.09',
+    quoteTime: Date.parse('2026-11-18T09:59:50+08:00')
 }];
 
 // 等待当前请求的异步回调完成，不触发真实轮询。
@@ -15,6 +16,7 @@ async function flush() {
 // 提供可检查的 VS Code 界面、配置与虚拟计时器。
 function createHarness() {
     const state = {
+        now: Date.parse('2026-11-18T10:00:00+08:00'),
         settings: { stockCodes: ['sh000001'], updateInterval: 3000 },
         requests: [],
         timers: new Map(),
@@ -68,6 +70,8 @@ function createHarness() {
         }
     };
     const controller = createStockController(vscode, {
+        // 固定北京时间，避免测试结果受真实时间和宿主时区影响。
+        now() { return state.now; },
         // 允许请求在停止后仍完成，以检验过期回调隔离。
         fetchQuotes(codes, { signal }) {
             // 将完成权交给测试，精确控制异步请求顺序。
@@ -91,10 +95,11 @@ function createHarness() {
             affectsConfiguration(value) { return value === section; }
         });
     }
-    // 执行一次等待任务，同时模拟计时器自然移除。
+    // 推进虚拟时钟并执行一次等待任务，同时模拟计时器自然移除。
     function runTimer() {
         const [id, timer] = state.timers.entries().next().value;
         state.timers.delete(id);
+        state.now += timer.delay;
         timer.callback();
     }
     return { state, item, controller, changeConfiguration, runTimer };
@@ -184,7 +189,8 @@ test('配置变更中断旧请求并立即生效', async function testConfigurat
     assert.equal(state.requests[0].signal.aborted, true);
     assert.deepEqual(state.requests[1].codes, ['sz002649']);
     state.requests[1].resolve([{
-        code: 'sz002649', name: '博彦科技', price: '8.91', changePercent: '-0.50'
+        code: 'sz002649', name: '博彦科技', price: '8.91', changePercent: '-0.50',
+        quoteTime: SAMPLE[0].quoteTime
     }]);
     await flush();
     state.requests[0].resolve(SAMPLE);
@@ -297,4 +303,119 @@ test('释放清理所有资源且不可再次启动', async function testDispose
     assert.equal(item.disposed, 1);
     assert.equal(state.listenerDisposed, 1);
     assert.equal(state.outputDisposed, 1);
+});
+
+// 获取成功也必须揭示行情本身过期，而不是把本地获取时间当作更新时间。
+test('旧行情标记警告并分别显示行情时间与获取时间', async function testStaleSnapshot() {
+    const { controller, state, item } = createHarness();
+    controller.start();
+    state.requests[0].resolve([{ ...SAMPLE[0],
+        quoteTime: Date.parse('2026-11-17T15:00:00+08:00') }]);
+    await flush();
+    assert.match(item.text, /warning/);
+    assert.match(item.tooltip, /获取时间（北京时间）：2026-11-18 10:00:00/);
+    assert.match(item.tooltip, /行情时间：2026-11-17 15:00:00/);
+    assert.match(item.tooltip, /行情时间较旧/);
+    controller.dispose();
+});
+
+// 接口时间缺失时不能凭成功请求伪造数据新鲜度。
+test('缺失行情时间显示未知并提示', async function testUnknownTimestamp() {
+    const { controller, state, item } = createHarness();
+    controller.start();
+    state.requests[0].resolve([{ ...SAMPLE[0], quoteTime: null }]);
+    await flush();
+    assert.match(item.text, /warning/);
+    assert.match(item.tooltip, /行情时间：未知.*未提供有效行情时间/);
+    controller.dispose();
+});
+
+// 收盘后的当天快照保持正常显示，但轮询不再每三秒触发。
+test('收盘快照不误报过期且休市降频', async function testClosedMarket() {
+    const { controller, state, item } = createHarness();
+    state.now = Date.parse('2026-11-18T16:41:46+08:00');
+    controller.start();
+    state.requests[0].resolve([{ ...SAMPLE[0],
+        quoteTime: Date.parse('2026-11-18T16:15:00+08:00') }]);
+    await flush();
+    assert.doesNotMatch(item.text, /warning/);
+    assert.match(item.tooltip, /非交易时段/);
+    assert.equal([...state.timers.values()][0].delay, 60000);
+    controller.dispose();
+});
+
+// 重试逐次延长且恢复成功后下一次失败从初始退避重新开始。
+test('连续失败指数退避并在成功后重置', async function testBackoffReset() {
+    const { controller, state, item, runTimer } = createHarness();
+    controller.start();
+    for (const delay of [5000, 10000, 20000]) {
+        state.requests.at(-1).reject(new Error('断网'));
+        await flush();
+        assert.equal([...state.timers.values()][0].delay, delay);
+        assert.match(item.tooltip, new RegExp(`失败重试：${delay / 1000} 秒后`));
+        runTimer();
+    }
+    state.requests.at(-1).resolve([{ ...SAMPLE[0], quoteTime: state.now }]);
+    await flush();
+    assert.equal([...state.timers.values()][0].delay, 3000);
+    runTimer();
+    state.requests.at(-1).reject(new Error('再次断网'));
+    await flush();
+    assert.equal([...state.timers.values()][0].delay, 5000);
+    assert.match(item.tooltip, /行情时间：2026-11-18 10:00:35/);
+    controller.dispose();
+});
+
+// 服务端指定的等待时间必须覆盖常规刷新间隔并可被停止命令取消。
+test('限流按服务端要求等待且停止清理计时器', async function testRateLimit() {
+    const { controller, state, item, runTimer } = createHarness();
+    controller.start();
+    const error = Object.assign(new Error('HTTP 429'), {
+        statusCode: 429, retryAfterMs: 120000
+    });
+    state.requests[0].reject(error);
+    await flush();
+    assert.equal([...state.timers.values()][0].delay, 120000);
+    assert.match(item.tooltip, /失败重试：120 秒后/);
+    runTimer();
+    state.requests[1].reject(error);
+    await flush();
+    controller.stop();
+    assert.equal(state.timers.size, 0);
+    controller.dispose();
+});
+
+// 极大 Retry-After 分段等待，避免 Node.js 将溢出时限变成一毫秒。
+test('超长限流分段计时且不到期限不发请求', async function testLongRetry() {
+    const { controller, state, runTimer } = createHarness();
+    controller.start();
+    state.requests[0].reject(Object.assign(new Error('限流'), {
+        statusCode: 429, retryAfterMs: 2147483647 + 10000
+    }));
+    await flush();
+    assert.equal([...state.timers.values()][0].delay, 2147483647);
+    runTimer();
+    assert.equal(state.requests.length, 1);
+    assert.equal([...state.timers.values()][0].delay, 10000);
+    runTimer();
+    assert.equal(state.requests.length, 2);
+    controller.dispose();
+});
+
+// 被清除但已经排队的旧计时器不能覆盖新会话的计时器引用。
+test('重启后迟到的旧计时器不干扰新会话清理', async function testLateTimer() {
+    const { controller, state } = createHarness();
+    controller.start();
+    state.requests[0].resolve(SAMPLE);
+    await flush();
+    const oldTimer = [...state.timers.values()][0];
+    controller.stop();
+    controller.start();
+    state.requests[1].resolve(SAMPLE);
+    await flush();
+    oldTimer.callback();
+    assert.equal(state.requests.length, 2);
+    controller.stop();
+    assert.equal(state.timers.size, 0);
+    controller.dispose();
 });

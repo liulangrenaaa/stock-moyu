@@ -12,13 +12,14 @@ const {
 
 // 构造与真实接口字段位置一致的行情记录。
 function record(code = 'sh000001', {
-    name = '上证指数', price = '3587.83', percent = '0.09'
+    name = '上证指数', price = '3587.83', percent = '0.09', time = '20261118095950'
 } = {}) {
     const fields = Array(33).fill('');
     fields[0] = '1';
     fields[1] = name;
     fields[2] = code.slice(2);
     fields[3] = price;
+    fields[30] = time;
     fields[32] = percent;
     return `v_${code}="${fields.join('~')}";`;
 }
@@ -28,6 +29,7 @@ function createTransport({
     body = Buffer.from(record()),
     status = 200,
     contentType = 'text/plain; charset=utf-8',
+    headers = {},
     requestError,
     interrupted = false,
     stalled = false
@@ -41,7 +43,7 @@ function createTransport({
             const request = new EventEmitter();
             const response = new PassThrough();
             response.statusCode = status;
-            response.headers = { 'content-type': contentType };
+            response.headers = { 'content-type': contentType, ...headers };
             // 模拟请求取消时对连接的清理。
             request.destroy = function destroy(error) {
                 state.destroyed = true;
@@ -131,8 +133,10 @@ test('解析按代码匹配，保留顺序与零涨幅', function testParseOrder
         + record() + record('bj430047', { name: '其他' });
     const quotes = parseQuotes(body, ['sh000001', 'sz002649']);
     assert.deepEqual(quotes, [
-        { code: 'sh000001', name: '上证指数', price: '3587.83', changePercent: '0.09' },
-        { code: 'sz002649', name: '博彦科技', price: '8.91', changePercent: '0.00' }
+        { code: 'sh000001', name: '上证指数', price: '3587.83', changePercent: '0.09',
+            quoteTime: Date.parse('2026-11-18T09:59:50+08:00') },
+        { code: 'sz002649', name: '博彦科技', price: '8.91', changePercent: '0.00',
+            quoteTime: Date.parse('2026-11-18T09:59:50+08:00') }
     ]);
 });
 
@@ -244,4 +248,33 @@ test('同步网络异常转为拒绝结果', async function testSyncFailure() {
         }
     };
     await assert.rejects(requestQuotes(['sh000001'], { transport }), /initialization/);
+});
+
+// 接口时间缺失或非法时仍保留价格，交给界面提示时间未知。
+test('非法行情时间不会被日期自动修正或导致价格丢失', function testInvalidQuoteTime() {
+    for (const time of ['', '20260230095950', '20261118240000', 'garbage']) {
+        const quotes = parseQuotes(record('sh000001', { time }), ['sh000001']);
+        assert.equal(quotes[0].quoteTime, null);
+        assert.equal(quotes[0].price, '3587.83');
+    }
+});
+
+// HTTP 层必须把限流状态和重试时限一起交给轮询器。
+test('HTTP 429 保留 Retry-After 秒数和日期', async function testRetryHeaders() {
+    const at = Date.parse('2026-11-18T02:00:00Z');
+    for (const value of ['120', 'Wed, 18 Nov 2026 02:02:00 GMT']) {
+        const { transport, state } = createTransport({
+            status: 429, headers: { 'retry-after': value }
+        });
+        // 固定响应收到时间，使 HTTP 日期计算不依赖真实时钟。
+        function now() { return at; }
+        // 核对错误类型和最短等待，不仅检查错误文字。
+        function validate(error) {
+            assert.equal(error.statusCode, 429);
+            assert.equal(error.retryAfterMs, 120000);
+            return true;
+        }
+        await assert.rejects(requestQuotes(['sh000001'], { transport, now }), validate);
+        assert.equal(state.destroyed, true);
+    }
 });

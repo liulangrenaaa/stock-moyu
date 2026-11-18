@@ -2,7 +2,7 @@
   "name": "stock-moyu",
   "displayName": "股票摸鱼 · Stock Moyu",
   "description": "在 VS Code 状态栏查看股票行情。",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "liulangrenaaa",
   "license": "UNLICENSED",
   "engines": {
@@ -68,13 +68,13 @@
           "default": 3000,
           "minimum": 1000,
           "maximum": 3600000,
-          "description": "每次请求完成后等待的刷新间隔，单位毫秒，修改后立即生效。"
+          "description": "交易时段每次请求完成后的刷新间隔，单位毫秒；非交易时段降频，临近开盘恢复，失败时自动退避。时段按北京时间工作日判断，未接入节假日日历。"
         }
       }
     }
   },
   "scripts": {
-    "check": "node --check extension.js && node --check getStock.js",
+    "check": "node --check extension.js && node --check getStock.js && node --check refreshPolicy.js",
     "test": "node --test",
     "package": "vsce package --skip-license"
   },

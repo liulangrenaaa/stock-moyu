@@ -1,4 +1,6 @@
 const https = require('node:https');
+const { parseQuoteTime, parseRetryAfter } = require('./refreshPolicy');
+const { version } = require('./package.json');
 
 const DEFAULT_CODES = ['sh000001', 'sz002649'];
 const DEFAULT_INTERVAL = 3000;
@@ -53,7 +55,8 @@ function parseQuotes(body, codes) {
             code: match[1],
             name: fields[1],
             price: fields[3],
-            changePercent: fields[32]
+            changePercent: fields[32],
+            quoteTime: parseQuoteTime(fields[30])
         });
     }
     const quotes = [];
@@ -79,7 +82,9 @@ function formatQuotes(quotes) {
 }
 
 // 使用内置 HTTPS 获取行情，提供取消、总时限和响应体大小限制。
-function requestQuotes(codes, { signal, timeoutMs = 10000, transport = https } = {}) {
+function requestQuotes(codes, {
+    signal, timeoutMs = 10000, transport = https, now = Date.now
+} = {}) {
     const normalizedCodes = normalizeStockCodes(codes);
     // 将底层流事件转换为单次结算的请求结果。
     return new Promise(function executeRequest(resolve, reject) {
@@ -119,7 +124,10 @@ function requestQuotes(codes, { signal, timeoutMs = 10000, transport = https } =
                 return;
             }
             if (response.statusCode !== 200) {
-                finish(new Error(`行情接口返回 HTTP ${response.statusCode}。`));
+                const error = new Error(`行情接口返回 HTTP ${response.statusCode}。`);
+                error.statusCode = response.statusCode;
+                error.retryAfterMs = parseRetryAfter(response.headers['retry-after'], now());
+                finish(error);
                 response.destroy();
                 request?.destroy();
                 return;
@@ -159,7 +167,7 @@ function requestQuotes(codes, { signal, timeoutMs = 10000, transport = https } =
         try {
             request = transport.get(
                 `https://qt.gtimg.cn/q=${normalizedCodes.join(',')}`,
-                { signal, headers: { 'User-Agent': 'stock-moyu/0.1.0' } },
+                { signal, headers: { 'User-Agent': `stock-moyu/${version}` } },
                 onResponse
             );
             request.on('error', finish);

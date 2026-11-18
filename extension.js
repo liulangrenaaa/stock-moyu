@@ -6,6 +6,13 @@ const {
     formatQuotes,
     requestQuotes
 } = require('./getStock');
+const {
+    MAX_TIMER_DELAY,
+    formatTime,
+    getMarketState,
+    getQuoteWarning,
+    getRefreshDelay
+} = require('./refreshPolicy');
 
 let activeController;
 
@@ -13,7 +20,8 @@ let activeController;
 function createStockController(vscode, {
     fetchQuotes = requestQuotes,
     setTimer = setTimeout,
-    clearTimer = clearTimeout
+    clearTimer = clearTimeout,
+    now = Date.now
 } = {}) {
     const item = vscode.window.createStatusBarItem(
         'stockMoyu.quotes', vscode.StatusBarAlignment.Left
@@ -27,17 +35,38 @@ function createStockController(vscode, {
     let timer = null;
     let pendingRequest = null;
     let latestText = '';
+    let latestDetails = [];
     let lastError = '';
+    let failures = 0;
 
     // 判断异步结果是否仍属于当前开启的会话。
     function isCurrent(session) {
         return active && !disposed && session === generation;
     }
 
+    // 对超长等待分段计时，防止 Node.js 计时器溢出或提前触发导致绕过限流。
+    function scheduleRefresh(session, delay) {
+        const deadline = now() + delay;
+        // 每次唤醒重新检查截止时间，未到期时只继续等待。
+        function onRefreshTimer() {
+            if (!isCurrent(session)) return;
+            timer = null;
+            const remaining = deadline - now();
+            if (remaining > 0) {
+                timer = setTimer(onRefreshTimer, Math.min(remaining, MAX_TIMER_DELAY));
+            } else {
+                void refresh(session);
+            }
+        }
+        timer = setTimer(onRefreshTimer, Math.min(delay, MAX_TIMER_DELAY));
+    }
+
     // 完成本次请求后再安排下一次，避免慢网络下的请求重叠。
     async function refresh(session) {
         if (!isCurrent(session)) return;
         let interval = DEFAULT_INTERVAL;
+        let failure;
+        let details;
         try {
             const settings = vscode.workspace.getConfiguration('stockMoyu');
             interval = normalizeInterval(settings.get('updateInterval', DEFAULT_INTERVAL));
@@ -45,6 +74,7 @@ function createStockController(vscode, {
             pendingRequest = new AbortController();
             const quotes = await fetchQuotes(codes, { signal: pendingRequest.signal });
             if (!isCurrent(session)) return;
+            const fetchedAt = now();
             latestText = formatQuotes(quotes);
             item.text = latestText;
             const missing = [];
@@ -53,28 +83,37 @@ function createStockController(vscode, {
             for (const code of codes) {
                 if (!returned.has(code)) missing.push(code);
             }
-            const details = [
+            details = [
                 latestText,
-                `获取时间：${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`
+                `获取时间（北京时间）：${formatTime(fetchedAt)}`
             ];
+            for (const quote of quotes) {
+                const warning = getQuoteWarning(quote, fetchedAt);
+                const time = Number.isFinite(quote.quoteTime)
+                    ? formatTime(quote.quoteTime) : '未知';
+                details.push(`${quote.name} 行情时间：${time}${warning ? `（${warning}）` : ''}`);
+                if (warning) item.text = `$(warning) ${latestText}`;
+            }
             if (missing.length > 0) {
                 item.text = `$(warning) ${latestText}`;
                 details.push(`未返回有效行情：${missing.join(', ')}`);
             }
-            details.push('点击停止行情');
-            item.tooltip = details.join('\n');
+            latestDetails = [...details];
+            failures = 0;
             lastError = '';
         } catch (error) {
             if (!isCurrent(session)) return;
+            failure = error;
+            failures += 1;
             const message = error instanceof Error ? error.message : String(error);
             item.text = latestText
                 ? `$(warning) ${latestText}`
                 : '$(warning) 行情暂不可用';
-            item.tooltip = [
+            details = [
                 message,
                 latestText ? '当前显示上次成功获取的数据。' : '尚未获取到有效行情。',
-                '稍后自动重试，点击停止行情。'
-            ].join('\n');
+                ...latestDetails
+            ];
             if (message !== lastError) {
                 output.appendLine(message);
                 lastError = message;
@@ -82,11 +121,21 @@ function createStockController(vscode, {
         } finally {
             if (isCurrent(session)) {
                 pendingRequest = null;
-                // 保存唯一的待执行任务，停止时可以可靠清理。
-                timer = setTimer(function onRefreshTimer() {
-                    timer = null;
-                    void refresh(session);
-                }, interval);
+                const completedAt = now();
+                const delay = getRefreshDelay(interval, completedAt, {
+                    failures,
+                    retryAfterMs: failure?.retryAfterMs,
+                    statusCode: failure?.statusCode
+                });
+                details.push(
+                    getMarketState(completedAt).active
+                        ? '按交易时段刷新' : '非交易时段，降低刷新频率',
+                    '时段按北京时间工作日判断，未接入节假日日历。',
+                    `${failures ? '失败重试' : '下次刷新'}：${Math.ceil(delay / 1000)} 秒后`,
+                    '点击停止行情'
+                );
+                item.tooltip = details.join('\n');
+                scheduleRefresh(session, delay);
             }
         }
     }
@@ -97,7 +146,9 @@ function createStockController(vscode, {
         active = true;
         generation += 1;
         latestText = '';
+        latestDetails = [];
         lastError = '';
+        failures = 0;
         item.text = '$(sync~spin) 行情加载中';
         item.tooltip = '正在获取行情，点击停止。';
         item.show();
