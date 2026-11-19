@@ -1,8 +1,8 @@
 {
   "name": "stock-moyu",
   "displayName": "股票摸鱼 · Stock Moyu",
-  "description": "在 VS Code 状态栏查看股票行情。",
-  "version": "0.1.1",
+  "description": "通过快捷键悬浮查看自选股票行情，状态栏保留精简摘要。",
+  "version": "0.2.0",
   "publisher": "liulangrenaaa",
   "license": "UNLICENSED",
   "engines": {
@@ -35,8 +35,30 @@
         "command": "stockMoyu.stop",
         "title": "停止行情",
         "category": "Stock Moyu"
+      },
+      {
+        "command": "stockMoyu.togglePopup",
+        "title": "切换悬浮行情",
+        "category": "Stock Moyu"
+      },
+      {
+        "command": "stockMoyu.configure",
+        "title": "编辑自选股票",
+        "category": "Stock Moyu"
       }
     ],
+    "keybindings": [
+      {
+        "command": "stockMoyu.togglePopup",
+        "key": "ctrl+alt+s",
+        "mac": "cmd+ctrl+s"
+      }
+    ],
+    "configurationDefaults": {
+      "terminal.integrated.commandsToSkipShell": [
+        "stockMoyu.togglePopup"
+      ]
+    },
     "menus": {
       "editor/context": [
         {
@@ -69,12 +91,19 @@
           "minimum": 1000,
           "maximum": 3600000,
           "description": "交易时段每次请求完成后的刷新间隔，单位毫秒；非交易时段降频，临近开盘恢复，失败时自动退避。时段按北京时间工作日判断，未接入节假日日历。"
+        },
+        "stockMoyu.statusBarMaxStocks": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "状态栏最多显示的股票数量，其余通过悬浮行情查看。"
         }
       }
     }
   },
   "scripts": {
-    "check": "node --check extension.js && node --check getStock.js && node --check refreshPolicy.js",
+    "check": "node --check extension.js && node --check getStock.js && node --check refreshPolicy.js && node --check quotePopup.js",
     "test": "node --test",
     "package": "vsce package --skip-license"
   },

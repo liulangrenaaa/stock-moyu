@@ -13,6 +13,7 @@ const {
     getQuoteWarning,
     getRefreshDelay
 } = require('./refreshPolicy');
+const { createQuotePopup, formatStatusBar } = require('./quotePopup');
 
 let activeController;
 
@@ -27,17 +28,28 @@ function createStockController(vscode, {
         'stockMoyu.quotes', vscode.StatusBarAlignment.Left
     );
     item.name = 'Stock Moyu 股票行情';
-    item.command = 'stockMoyu.stop';
+    item.command = 'stockMoyu.togglePopup';
     const output = vscode.window.createOutputChannel('Stock Moyu');
     let active = false;
     let disposed = false;
     let generation = 0;
+    let timerGeneration = 0;
     let timer = null;
     let pendingRequest = null;
     let latestText = '';
     let latestDetails = [];
     let lastError = '';
     let failures = 0;
+    let nextRefreshAt = 0;
+    let popupState = {
+        codes: [], quotes: [], busy: false, error: '', fetchedAt: null, nextRefreshAt: 0
+    };
+    const popup = createQuotePopup(vscode, {
+        onRefresh: refreshNow,
+        onConfigure: configure,
+        onStop: stop,
+        now
+    });
 
     // 判断异步结果是否仍属于当前开启的会话。
     function isCurrent(session) {
@@ -47,9 +59,10 @@ function createStockController(vscode, {
     // 对超长等待分段计时，防止 Node.js 计时器溢出或提前触发导致绕过限流。
     function scheduleRefresh(session, delay) {
         const deadline = now() + delay;
+        const scheduled = ++timerGeneration;
         // 每次唤醒重新检查截止时间，未到期时只继续等待。
         function onRefreshTimer() {
-            if (!isCurrent(session)) return;
+            if (!isCurrent(session) || scheduled !== timerGeneration) return;
             timer = null;
             const remaining = deadline - now();
             if (remaining > 0) {
@@ -71,12 +84,15 @@ function createStockController(vscode, {
             const settings = vscode.workspace.getConfiguration('stockMoyu');
             interval = normalizeInterval(settings.get('updateInterval', DEFAULT_INTERVAL));
             const codes = normalizeStockCodes(settings.get('stockCodes', DEFAULT_CODES));
+            popupState = { ...popupState, codes, busy: true };
+            popup.update(popupState);
             pendingRequest = new AbortController();
             const quotes = await fetchQuotes(codes, { signal: pendingRequest.signal });
             if (!isCurrent(session)) return;
             const fetchedAt = now();
-            latestText = formatQuotes(quotes);
+            latestText = formatStatusBar(quotes, codes.length, settings.get('statusBarMaxStocks', 2));
             item.text = latestText;
+            popupState = { ...popupState, quotes, fetchedAt, error: '' };
             const missing = [];
             const returned = new Set();
             for (const quote of quotes) returned.add(quote.code);
@@ -84,7 +100,7 @@ function createStockController(vscode, {
                 if (!returned.has(code)) missing.push(code);
             }
             details = [
-                latestText,
+                formatQuotes(quotes),
                 `获取时间（北京时间）：${formatTime(fetchedAt)}`
             ];
             for (const quote of quotes) {
@@ -114,6 +130,7 @@ function createStockController(vscode, {
                 latestText ? '当前显示上次成功获取的数据。' : '尚未获取到有效行情。',
                 ...latestDetails
             ];
+            popupState = { ...popupState, error: message };
             if (message !== lastError) {
                 output.appendLine(message);
                 lastError = message;
@@ -132,9 +149,12 @@ function createStockController(vscode, {
                         ? '按交易时段刷新' : '非交易时段，降低刷新频率',
                     '时段按北京时间工作日判断，未接入节假日日历。',
                     `${failures ? '失败重试' : '下次刷新'}：${Math.ceil(delay / 1000)} 秒后`,
-                    '点击停止行情'
+                    '自选行情'
                 );
                 item.tooltip = details.join('\n');
+                nextRefreshAt = completedAt + delay;
+                popupState = { ...popupState, busy: false, nextRefreshAt };
+                popup.update(popupState);
                 scheduleRefresh(session, delay);
             }
         }
@@ -149,8 +169,12 @@ function createStockController(vscode, {
         latestDetails = [];
         lastError = '';
         failures = 0;
+        nextRefreshAt = 0;
+        popupState = {
+            codes: [], quotes: [], busy: true, error: '', fetchedAt: null, nextRefreshAt: 0
+        };
         item.text = '$(sync~spin) 行情加载中';
-        item.tooltip = '正在获取行情，点击停止。';
+        item.tooltip = '正在获取行情';
         item.show();
         void refresh(generation);
     }
@@ -159,18 +183,55 @@ function createStockController(vscode, {
     function stop() {
         active = false;
         generation += 1;
+        timerGeneration += 1;
         if (timer !== null) clearTimer(timer);
         timer = null;
         pendingRequest?.abort();
         pendingRequest = null;
+        popup.hide();
         item.hide();
+    }
+
+    // 手动刷新复用单个请求并遵守失败退避，避免按钮连击绕过接口限流。
+    function refreshNow() {
+        if (disposed) return;
+        if (!active) {
+            start();
+            return;
+        }
+        if (pendingRequest || (failures > 0 && now() < nextRefreshAt)) {
+            popup.update(popupState);
+            return;
+        }
+        timerGeneration += 1;
+        if (timer !== null) clearTimer(timer);
+        timer = null;
+        void refresh(generation);
+    }
+
+    // 首次通过快捷键查看时自动开启行情，再切换悬浮列表。
+    function togglePopup() {
+        if (disposed) return;
+        if (!active) start();
+        popup.update(popupState);
+        popup.toggle();
+    }
+
+    // 打开自选配置入口，沿用 VS Code 对用户和工作区设置的管理。
+    function configure() {
+        return vscode.commands.executeCommand('workbench.action.openSettings', 'stockMoyu.stockCodes');
     }
 
     // 仅在本插件配置变化时重启会话，使修改立即生效。
     function onConfigurationChanged(event) {
         if (active && event.affectsConfiguration('stockMoyu')) {
+            const reopen = popup.isVisible();
             stop();
             start();
+            if (reopen) {
+                popup.update(popupState);
+                popup.toggle();
+            }
         }
     }
 
@@ -182,11 +243,12 @@ function createStockController(vscode, {
         stop();
         disposed = true;
         listener.dispose();
+        popup.dispose();
         item.dispose();
         output.dispose();
     }
 
-    return { start, stop, dispose };
+    return { start, stop, dispose, togglePopup, refreshNow, configure };
 }
 
 // 注册独立命令，避免与已安装原版插件争用命令或配置。
@@ -196,7 +258,9 @@ function activate(context) {
     context.subscriptions.push(
         activeController,
         vscode.commands.registerCommand('stockMoyu.start', activeController.start),
-        vscode.commands.registerCommand('stockMoyu.stop', activeController.stop)
+        vscode.commands.registerCommand('stockMoyu.stop', activeController.stop),
+        vscode.commands.registerCommand('stockMoyu.togglePopup', activeController.togglePopup),
+        vscode.commands.registerCommand('stockMoyu.configure', activeController.configure)
     );
 }
 

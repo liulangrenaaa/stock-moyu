@@ -1,6 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createStockController } = require('../extension');
+const { createQuickPickHarness } = require('../test-support/quickPickHarness');
 
 const SAMPLE = [{
     code: 'sh000001', name: '上证指数', price: '3587.83', changePercent: '0.09',
@@ -15,6 +16,7 @@ async function flush() {
 
 // 提供可检查的 VS Code 界面、配置与虚拟计时器。
 function createHarness() {
+    const quickPick = createQuickPickHarness();
     const state = {
         now: Date.parse('2026-11-18T10:00:00+08:00'),
         settings: { stockCodes: ['sh000001'], updateInterval: 3000 },
@@ -36,8 +38,11 @@ function createHarness() {
         dispose() { this.disposed += 1; }
     };
     const vscode = {
+        ThemeIcon: quickPick.ThemeIcon,
+        commands: quickPick.commands,
         StatusBarAlignment: { Left: 1 },
         window: {
+            createQuickPick: quickPick.createQuickPick,
             // 返回可观察的状态栏对象。
             createStatusBarItem() { return item; },
             // 收集错误日志并跟踪输出面板释放。
@@ -102,7 +107,7 @@ function createHarness() {
         state.now += timer.delay;
         timer.callback();
     }
-    return { state, item, controller, changeConfiguration, runTimer };
+    return { state, item, controller, changeConfiguration, runTimer, quickPick };
 }
 
 // 首次开启应立即请求，重复开启不产生额外任务。
@@ -416,6 +421,110 @@ test('重启后迟到的旧计时器不干扰新会话清理', async function te
     oldTimer.callback();
     assert.equal(state.requests.length, 2);
     controller.stop();
+    assert.equal(state.timers.size, 0);
+    controller.dispose();
+});
+
+// 快捷键入口应自动请求并把结果同步到唯一浮层，不能额外启动轮询。
+test('悬浮入口自动开启行情且与状态栏共享刷新', async function testPopupFlow() {
+    const { controller, state, item, quickPick, runTimer } = createHarness();
+    controller.togglePopup();
+    const picker = quickPick.state.pickers[0];
+    assert.equal(picker.visible, true);
+    assert.equal(picker.busy, true);
+    assert.equal(state.requests.length, 1);
+    state.requests[0].resolve(SAMPLE);
+    await flush();
+    assert.match(picker.items[0].label, /上证指数.*3587.83/);
+    assert.equal(picker.busy, false);
+    assert.equal(item.command, 'stockMoyu.togglePopup');
+    controller.togglePopup();
+    assert.equal(picker.visible, false);
+    runTimer();
+    state.requests[1].resolve(SAMPLE);
+    await flush();
+    assert.equal(picker.visible, false);
+    controller.togglePopup();
+    assert.equal(quickPick.state.pickers.length, 1);
+    assert.equal(picker.visible, true);
+    controller.dispose();
+    assert.equal(picker.disposed, 1);
+});
+
+// 手动刷新不能与已有请求重叠，也不能让旧等待回调重新启动请求。
+test('手动刷新取消旧计时器并隔离迟到回调', async function testManualRefreshRace() {
+    const { controller, state } = createHarness();
+    controller.start();
+    controller.refreshNow();
+    assert.equal(state.requests.length, 1);
+    state.requests[0].resolve(SAMPLE);
+    await flush();
+    const oldTimer = [...state.timers.values()][0];
+    controller.refreshNow();
+    assert.equal(state.timers.size, 0);
+    assert.equal(state.requests.length, 2);
+    oldTimer.callback();
+    assert.equal(state.requests.length, 2);
+    state.requests[1].resolve(SAMPLE);
+    await flush();
+    oldTimer.callback();
+    controller.stop();
+    assert.equal(state.timers.size, 0);
+    controller.dispose();
+});
+
+// 打开浮层和点击刷新都不能绕过接口限流所要求的等待。
+test('悬浮列表手动刷新遵守限流退避', async function testPopupRateLimit() {
+    const { controller, state, quickPick } = createHarness();
+    controller.togglePopup();
+    state.requests[0].reject(Object.assign(new Error('HTTP 429'), {
+        statusCode: 429, retryAfterMs: 120000
+    }));
+    await flush();
+    const picker = quickPick.state.pickers[0];
+    quickPick.emit(picker, 'button', picker.buttons[0]);
+    controller.togglePopup();
+    controller.togglePopup();
+    assert.equal(state.requests.length, 1);
+    assert.match(picker.title, /等待自动重试/);
+    assert.match(picker.placeholder, /HTTP 429/);
+    controller.dispose();
+});
+
+// 较多股票只在状态栏显示摘要，悬浮列表保留所有有效与缺失代码。
+test('多股票状态栏精简而悬浮列表完整', async function testManyStocks() {
+    const { controller, state, item, quickPick } = createHarness();
+    state.settings.stockCodes = ['sh000001', 'sz002649', 'sh600519', 'sz000001'];
+    controller.togglePopup();
+    state.requests[0].resolve([SAMPLE[0],
+        { ...SAMPLE[0], code: 'sz002649', name: '博彦科技' },
+        { ...SAMPLE[0], code: 'sh600519', name: '贵州茅台' }]);
+    await flush();
+    assert.match(item.text, /\+2只/);
+    assert.doesNotMatch(item.text, /贵州茅台/);
+    const picker = quickPick.state.pickers[0];
+    assert.equal(picker.items.length, 4);
+    assert.match(picker.items[2].label, /贵州茅台/);
+    assert.match(picker.items[3].description, /暂无有效行情/);
+    controller.dispose();
+});
+
+// 配置变更时浮层同步新代码，停止命令则关闭浮层与所有请求。
+test('浮层随自选配置变化更新并在停止后关闭', async function testPopupConfiguration() {
+    const { controller, state, quickPick, changeConfiguration } = createHarness();
+    controller.togglePopup();
+    state.requests[0].resolve(SAMPLE);
+    await flush();
+    state.settings.stockCodes = ['sz002649'];
+    changeConfiguration();
+    const picker = quickPick.state.pickers[0];
+    assert.equal(picker.visible, true);
+    assert.equal(picker.items[0].code, 'sz002649');
+    controller.stop();
+    assert.equal(picker.visible, false);
+    assert.equal(state.requests[1].signal.aborted, true);
+    state.requests[1].resolve([{ ...SAMPLE[0], code: 'sz002649' }]);
+    await flush();
     assert.equal(state.timers.size, 0);
     controller.dispose();
 });
